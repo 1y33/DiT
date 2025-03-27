@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import test_vae
+import test_clip
+import torch
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -15,13 +18,12 @@ class PatchLatent(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
     
     def forward(self, x):
+        device = x.device  
         x = self.patch_latent(x)          
         x = x.flatten(2).transpose(1, 2)    
         
-        print(x.shape)
-        print(self.pos_embed.shape)
-        
-        x = x + self.pos_embed             
+        pos_embed = self.pos_embed.to(device)
+        x = x + pos_embed
         return x
 
 class MultiheadAttention(nn.Module):
@@ -34,7 +36,6 @@ class MultiheadAttention(nn.Module):
         self.wk = nn.Linear(embed_dim, embed_dim, bias=False)
         self.wv = nn.Linear(embed_dim, embed_dim, bias=False)
         self.wo = nn.Linear(embed_dim, embed_dim)
-        
         self.scale = math.sqrt(self.head_dim)
     
     def forward(self, x):
@@ -56,19 +57,16 @@ class MLP(nn.Module):
         super().__init__()
         hidden_dim = int(embed_dim * mlp_ratio)
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, embed_dim)
     
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
+        x = F.gelu(self.fc1(x))
         x = self.fc2(x)
         return x
 
 class DiTBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = MultiheadAttention(embed_dim, num_heads)
         self.norm2 = nn.LayerNorm(embed_dim)
@@ -92,43 +90,107 @@ class DiTBlock(nn.Module):
 class DiT(nn.Module):
     def __init__(self, in_channels=3, embed_dim=512, image_size=32, patch_size=2,n_layers = 12, num_heads=8):
         super().__init__()
+        self.imagesize = image_size
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+        
         self.patch_embed = PatchLatent(in_channels, embed_dim, image_size, patch_size)
-
         self.clip_text = test_clip.get_cliptext_project(target_config=512,device="cuda")
-
         self.blocks = nn.ModuleList([DiTBlock(embed_dim, num_heads) for _ in range(n_layers)])
         
         self.norm = nn.LayerNorm(embed_dim)
-        self.final_proj = nn.Linear(embed_dim, embed_dim)
+        self.final_proj_1 = nn.Linear(embed_dim, embed_dim*4)
+        self.final_proj_2 = nn.Linear(embed_dim*4, in_channels * (patch_size ** 2))
     
-    def forward(self, x,prompt):
-        # x: (N, C, H, W)
-        x = self.patch_embed(x)  # (N, num_patches, embed_dim)
-        c = self.clip_text("prompt")
-        print("Embeddings " ,c.shape)
+    def forward(self, x, prompt):
+        x = self.patch_embed(x)  
+        c = self.clip_text(prompt)
         
         for blk in self.blocks:
             x = blk(x, c)
         x = self.norm(x)
-        x = self.final_proj(x)
+        x = self.final_proj_1(x)
+        x = F.gelu(x)
+        x = self.final_proj_2(x)  
+        
+        x = x.reshape(x.shape[0], -1)  
+        x = x.reshape(x.shape[0], self.in_channels, self.imagesize, self.imagesize)
         return x
 
-import test_vae
-import test_clip
+class StableDIT:
+    def __init__(self, device="cuda"):
+        self.device = device
+        self.model = DiT(in_channels=4, embed_dim=512, image_size=32, patch_size=2, n_layers=24, num_heads=8).to(device)
+        self.vae_encoder = test_vae.get_vae_projector(device)
+        self.clip_text = test_clip.get_cliptext_project(target_config=512, device=device)
+        
+        self.timesteps = 1000
+        self.beta_start = 1e-4
+        self.beta_end = 0.02
 
-if __name__ == '__main__':
+    def get_noise_schedule(self):
+        betas = torch.linspace(self.beta_start, self.beta_end, self.timesteps, device=self.device)
+        alphas = 1 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.ones(1, device=self.device), alphas_cumprod[:-1]])
+        
+        return {
+            'betas': betas,
+            'alphas': alphas,
+            'alphas_cumprod': alphas_cumprod,
+            'alphas_cumprod_prev': alphas_cumprod_prev,
+            'sqrt_alphas_cumprod': torch.sqrt(alphas_cumprod),
+            'sqrt_one_minus_alphas_cumprod': torch.sqrt(1 - alphas_cumprod),
+            'sqrt_recip_alphas': torch.sqrt(1 / alphas),
+            'posterior_variance': betas * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
+        }
     
-    dim_embed = 512
-    input_img = torch.randn(1, 3, 256, 256).to("cuda")
-    vae_encoder = test_vae.get_vae_projector()
+    def add_noise(self, x, t, noise=None):
+        noise_schedule = self.get_noise_schedule()
+        noise = torch.randn_like(x) if noise is None else noise
+        
+        sqrt_alphas_cumprod_t = noise_schedule['sqrt_alphas_cumprod'][t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = noise_schedule['sqrt_one_minus_alphas_cumprod'][t].view(-1, 1, 1, 1)
+        x_noisy = sqrt_alphas_cumprod_t * x + sqrt_one_minus_alphas_cumprod_t * noise
+        
+        return x_noisy, noise
     
-    model = DiT(in_channels=4, embed_dim=512, image_size=32, patch_size=2, n_layers=24, num_heads=8).to("cuda")
-    dummy_input = vae_encoder.encode(input_img)
-    print("VAE SIZE",dummy_input.shape)
-    out = model(dummy_input,"cat")
+    def loss_function(self, images, prompts):
+        batch_size = images.shape[0]
+        
+        with torch.inference_mode():
+            latents = self.vae_encoder.encode(images)
+        
+        t = torch.randint(0, self.timesteps, (batch_size,), device=self.device)
+        noise = torch.randn_like(latents)
+        noisy_latents, target_noise = self.add_noise(latents, t, noise)
+        
+        predicted = self.model(noisy_latents, prompts)
+        
+        loss = F.mse_loss(predicted, target_noise)
+        return loss
     
-    print("Output shape:", out.shape)
-    # Expected output shape: (N, num_patches, embed_dim)
-    
-    print("Model size: " , sum(p.numel() for p in model.parameters()))
-
+    def sample(self, prompt, batch_size=1, guidance_scale=7.5):
+        noise_schedule = self.get_noise_schedule()
+        shape = (batch_size, 4, 32, 32)
+        
+        x = torch.randn(shape, device=self.device)
+        
+        for i in range(self.timesteps - 1, -1, -1):
+            t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+            
+            betas_t = noise_schedule['betas'][t]
+            sqrt_one_minus_alphas_cumprod_t = noise_schedule['sqrt_one_minus_alphas_cumprod'][t]
+            sqrt_recip_alphas_t = noise_schedule['sqrt_recip_alphas'][t]
+            
+            predicted_noise = self.model(x, prompt)
+            
+            if i > 0:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.zeros_like(x)
+                
+            x = (sqrt_recip_alphas_t * (x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t) + torch.sqrt(betas_t) * noise)
+            
+        return x
